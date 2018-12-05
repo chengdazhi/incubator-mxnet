@@ -292,6 +292,7 @@ __global__ void nms_kernel(const int n_boxes, const float nms_overlap_thresh,
         min(n_boxes - col_start * threadsPerBlock, threadsPerBlock);
 
   __shared__ float block_boxes[threadsPerBlock * 5];
+
   if (threadIdx.x < col_size) {
     block_boxes[threadIdx.x * 5 + 0] =
         dev_boxes[img_start * n_boxes * 5 + (threadsPerBlock * col_start + threadIdx.x) * 5 + 0];
@@ -306,8 +307,9 @@ __global__ void nms_kernel(const int n_boxes, const float nms_overlap_thresh,
   }
   __syncthreads();
 
+
   if (threadIdx.x < row_size) {
-    const int cur_box_idx = img_start * n_boxes * 5 + threadsPerBlock * row_start + threadIdx.x;
+    const int cur_box_idx = img_start * n_boxes + threadsPerBlock * row_start + threadIdx.x;
     const float *cur_box = dev_boxes + cur_box_idx * 5;
     int i = 0;
     uint64_t t = 0;
@@ -338,6 +340,9 @@ void _nms(const mshadow::Tensor<gpu, 3>& boxes,
   float* boxes_dev = boxes.dptr_;
   uint64_t* mask_dev = NULL;
 
+  std::time_t tstart, tend;
+  tstart = std::clock();
+
   const int col_blocks = DIVUP(boxes_num, threadsPerBlock);
   FRCNN_CUDA_CHECK(cudaMalloc(&mask_dev, num_images * boxes_num * col_blocks * sizeof(uint64_t)));
 
@@ -354,6 +359,9 @@ void _nms(const mshadow::Tensor<gpu, 3>& boxes,
                               sizeof(uint64_t) * num_images * boxes_num * col_blocks,
                               cudaMemcpyDeviceToHost));
 
+  tend = std::clock();
+  std::cout << "nms took "<< (double)(tend - tstart)/CLOCKS_PER_SEC <<" second(s)."<< std::endl;
+
   for (int img_idx = 0; img_idx < num_images; img_idx++) {
       std::vector<uint64_t> remv(col_blocks);
       memset(&remv[0], 0, sizeof(uint64_t) * col_blocks);
@@ -364,7 +372,7 @@ void _nms(const mshadow::Tensor<gpu, 3>& boxes,
         int inblock = i % threadsPerBlock;
 
         if (!(remv[nblock] & (1ULL << inblock))) {
-          keep[img_idx * rpn_post_nms_top_n + (num_to_keep++)] = i;
+          keep[img_idx * boxes_num + (num_to_keep++)] = img_idx * boxes_num + i;
           if (num_to_keep >= rpn_post_nms_top_n) break;
           uint64_t *p = &mask_host[0] + img_idx * boxes_num * col_blocks + i * col_blocks;
           for (int j = nblock; j < col_blocks; j++) {
@@ -577,7 +585,7 @@ class MultiProposalGPUOp : public Operator{
         CheckLaunchParam(dimGrid, dimBlock, "PrepareOutput");
         // todo: slice keep
         PrepareOutput << <dimGrid, dimBlock >> >(
-            param_.rpn_post_nms_top_n, workspace_ordered_proposals.dptr_ + b * rpn_pre_nms_top_n * 5,
+            param_.rpn_post_nms_top_n, workspace_ordered_proposals.dptr_,
             keep, out_size[b], b, rpn_pre_nms_top_n, 
             out.dptr_ + b * param_.rpn_post_nms_top_n * 5,
             out_score.dptr_ + b * param_.rpn_post_nms_top_n);
