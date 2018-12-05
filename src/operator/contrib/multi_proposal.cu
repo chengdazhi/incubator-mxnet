@@ -280,6 +280,7 @@ __device__ inline float devIoU(float const * const a, float const * const b) {
 __global__ void nms_kernel(const int n_boxes, const float nms_overlap_thresh,
                            const float *dev_boxes, uint64_t *dev_mask) {
   const int threadsPerBlock = sizeof(uint64_t) * 8;
+  const int img_start = blockIdx.z;
   const int row_start = blockIdx.y;
   const int col_start = blockIdx.x;
 
@@ -293,20 +294,20 @@ __global__ void nms_kernel(const int n_boxes, const float nms_overlap_thresh,
   __shared__ float block_boxes[threadsPerBlock * 5];
   if (threadIdx.x < col_size) {
     block_boxes[threadIdx.x * 5 + 0] =
-        dev_boxes[(threadsPerBlock * col_start + threadIdx.x) * 5 + 0];
+        dev_boxes[img_start * n_boxes * 5 + (threadsPerBlock * col_start + threadIdx.x) * 5 + 0];
     block_boxes[threadIdx.x * 5 + 1] =
-        dev_boxes[(threadsPerBlock * col_start + threadIdx.x) * 5 + 1];
+        dev_boxes[img_start * n_boxes * 5 + (threadsPerBlock * col_start + threadIdx.x) * 5 + 1];
     block_boxes[threadIdx.x * 5 + 2] =
-        dev_boxes[(threadsPerBlock * col_start + threadIdx.x) * 5 + 2];
+        dev_boxes[img_start * n_boxes * 5 + (threadsPerBlock * col_start + threadIdx.x) * 5 + 2];
     block_boxes[threadIdx.x * 5 + 3] =
-        dev_boxes[(threadsPerBlock * col_start + threadIdx.x) * 5 + 3];
+        dev_boxes[img_start * n_boxes * 5 + (threadsPerBlock * col_start + threadIdx.x) * 5 + 3];
     block_boxes[threadIdx.x * 5 + 4] =
-        dev_boxes[(threadsPerBlock * col_start + threadIdx.x) * 5 + 4];
+        dev_boxes[img_start * n_boxes * 5 + (threadsPerBlock * col_start + threadIdx.x) * 5 + 4];
   }
   __syncthreads();
 
   if (threadIdx.x < row_size) {
-    const int cur_box_idx = threadsPerBlock * row_start + threadIdx.x;
+    const int cur_box_idx = img_start * n_boxes * 5 + threadsPerBlock * row_start + threadIdx.x;
     const float *cur_box = dev_boxes + cur_box_idx * 5;
     int i = 0;
     uint64_t t = 0;
@@ -330,48 +331,49 @@ void _nms(const mshadow::Tensor<gpu, 2>& boxes,
           int *keep,
           int *num_out) {
   const int threadsPerBlock = sizeof(uint64_t) * 8;
-  const int boxes_num = boxes.size(0);
-  const int boxes_dim = boxes.size(1);
+  const int num_images = boxes.size(0);
+  const int boxes_num = boxes.size(1);
+  const int boxes_dim = boxes.size(2);
 
   float* boxes_dev = boxes.dptr_;
   uint64_t* mask_dev = NULL;
 
   const int col_blocks = DIVUP(boxes_num, threadsPerBlock);
-  FRCNN_CUDA_CHECK(cudaMalloc(&mask_dev,
-                              boxes_num * col_blocks * sizeof(uint64_t)));
+  FRCNN_CUDA_CHECK(cudaMalloc(&mask_dev, num_images * boxes_num * col_blocks * sizeof(uint64_t)));
 
-  dim3 blocks(DIVUP(boxes_num, threadsPerBlock),
-              DIVUP(boxes_num, threadsPerBlock));
+  dim3 blocks(DIVUP(boxes_num, threadsPerBlock), DIVUP(boxes_num, threadsPerBlock), num_images);
   dim3 threads(threadsPerBlock);
   nms_kernel<<<blocks, threads>>>(boxes_num,
                                   nms_overlap_thresh,
                                   boxes_dev,
                                   mask_dev);
   FRCNN_CUDA_CHECK(cudaPeekAtLastError());
-  std::vector<uint64_t> mask_host(boxes_num * col_blocks);
+  std::vector<uint64_t> mask_host(num_images * boxes_num * col_blocks);
   FRCNN_CUDA_CHECK(cudaMemcpy(&mask_host[0],
                               mask_dev,
-                              sizeof(uint64_t) * boxes_num * col_blocks,
+                              sizeof(uint64_t) * num_images * boxes_num * col_blocks,
                               cudaMemcpyDeviceToHost));
 
-  std::vector<uint64_t> remv(col_blocks);
-  memset(&remv[0], 0, sizeof(uint64_t) * col_blocks);
+  for (int img_idx = 0; img_idx < num_images, img_idx++) {
+      std::vector<uint64_t> remv(col_blocks);
+      memset(&remv[0], 0, sizeof(uint64_t) * col_blocks);
 
-  int num_to_keep = 0;
-  for (int i = 0; i < boxes_num; i++) {
-    int nblock = i / threadsPerBlock;
-    int inblock = i % threadsPerBlock;
+      int num_to_keep = 0;
+      for (int i = 0; i < boxes_num; i++) {
+        int nblock = i / threadsPerBlock;
+        int inblock = i % threadsPerBlock;
 
-    if (!(remv[nblock] & (1ULL << inblock))) {
-      keep[num_to_keep++] = i;
-      if (num_to_keep >= rpn_post_nms_top_n) break;
-      uint64_t *p = &mask_host[0] + i * col_blocks;
-      for (int j = nblock; j < col_blocks; j++) {
-        remv[j] |= p[j];
+        if (!(remv[nblock] & (1ULL << inblock))) {
+          keep[img_idx * rpn_post_nms_top_n + (num_to_keep++)] = i;
+          if (num_to_keep >= rpn_post_nms_top_n) break;
+          uint64_t *p = &mask_host[0] + img_idx * boxes_num * col_blocks + i * col_blocks;
+          for (int j = nblock; j < col_blocks; j++) {
+            remv[j] |= p[j];
+          }
+        }
       }
-    }
+      num_out[img_idx] = num_to_keep;
   }
-  *num_out = num_to_keep;
 
   FRCNN_CUDA_CHECK(cudaFree(mask_dev));
 }
@@ -385,20 +387,22 @@ __global__ void PrepareOutput(const int count,
                               const int* keep,
                               const int out_size,
                               const int image_index,
+                              const int rpn_pre_nms_top_n,
                               Dtype* out,
                               Dtype* score) {
+  keep_start = image_index * rpn_pre_nms_top_n;
   for (int index = blockIdx.x * blockDim.x + threadIdx.x;
        index < count;
        index += blockDim.x * gridDim.x) {
     out[index * 5] = image_index;
     if (index < out_size) {
-      int keep_i = keep[index];
+      int keep_i = keep[keep_start + index];
       for (int j = 0; j < 4; ++j) {
         out[index * 5 + j + 1] = dets[keep_i * 5 + j];
       }
       score[index] = dets[keep_i * 5 + 4];
     } else {
-      int keep_i = keep[index % out_size];
+      int keep_i = keep[keep_start + index % out_size];
       for (int j = 0; j < 4; ++j) {
         out[index * 5 + j + 1] = dets[keep_i * 5 + j];
       }
@@ -521,12 +525,12 @@ class MultiProposalGPUOp : public Operator{
 
     float* workspace_ordered_proposals_ptr = NULL;
     FRCNN_CUDA_CHECK(cudaMalloc(&workspace_ordered_proposals_ptr,
-        sizeof(float) * rpn_pre_nms_top_n * 5));
-    Tensor<xpu, 2> workspace_ordered_proposals(workspace_ordered_proposals_ptr,
-        Shape2(rpn_pre_nms_top_n, 5));
+        sizeof(float) * num_images * rpn_pre_nms_top_n * 5));
+    Tensor<xpu, 3> workspace_ordered_proposals(workspace_ordered_proposals_ptr,
+        Shape3(num_images, rpn_pre_nms_top_n, 5));
 
     int* keep;
-    FRCNN_CUDA_CHECK(cudaMalloc(&keep, sizeof(int) * rpn_pre_nms_top_n));
+    FRCNN_CUDA_CHECK(cudaMalloc(&keep, sizeof(int) * num_images * rpn_pre_nms_top_n));
 
     for (int b = 0; b < num_images; b++) {
         CheckLaunchParam(dimGrid, dimBlock, "CopyScore");
@@ -547,29 +551,34 @@ class MultiProposalGPUOp : public Operator{
 
         dimGrid.x = (rpn_pre_nms_top_n + kMaxThreadsPerBlock - 1) / kMaxThreadsPerBlock;
         CheckLaunchParam(dimGrid, dimBlock, "ReorderProposals");
+        // todo: when reordering, use image indexing
         ReorderProposalsKernel << <dimGrid, dimBlock >> >(
             rpn_pre_nms_top_n, workspace_proposals.dptr_ + b * count_anchors * 5,
-            order.dptr_, workspace_ordered_proposals.dptr_);
+            order.dptr_, workspace_ordered_proposals.dptr_ + b * rpn_pre_nms_top_n * 5);
         FRCNN_CUDA_CHECK(cudaPeekAtLastError());
+    }
 
-        // perform nms
-        std::vector<int> _keep(workspace_ordered_proposals.size(0));
-        int out_size = 0;
-        _nms(workspace_ordered_proposals,
-            param_.threshold,
-            rpn_post_nms_top_n,
-            &_keep[0],
-            &out_size);
+    // perform nms
+    std::vector<int> _keep(workspace_ordered_proposals.size(0) * workspace_ordered_proposals.size(1));
+    std::vector<int> out_size(num_images);
+    _nms(workspace_ordered_proposals,
+        param_.threshold,
+        rpn_post_nms_top_n,
+        &_keep[0],
+        &out_size[0]);
 
-        // copy nms result to gpu
-        FRCNN_CUDA_CHECK(cudaMemcpy(keep, &_keep[0], sizeof(int) * _keep.size(),
-            cudaMemcpyHostToDevice));
+    // copy nms result to gpu
+    FRCNN_CUDA_CHECK(cudaMemcpy(keep, &_keep[0], sizeof(int) * _keep.size(),
+        cudaMemcpyHostToDevice));
 
+    for (int b = 0; b < num_images; b++) {
         // copy results after nms
         dimGrid.x = (param_.rpn_post_nms_top_n + kMaxThreadsPerBlock - 1) / kMaxThreadsPerBlock;
         CheckLaunchParam(dimGrid, dimBlock, "PrepareOutput");
+        // todo: slice keep
         PrepareOutput << <dimGrid, dimBlock >> >(
-            param_.rpn_post_nms_top_n, workspace_ordered_proposals.dptr_, keep, out_size, b,
+            param_.rpn_post_nms_top_n, workspace_ordered_proposals.dptr_ + b * rpn_pre_nms_top_n * 5,
+            keep, out_size[b], b, rpn_pre_nms_top_n, 
             out.dptr_ + b * param_.rpn_post_nms_top_n * 5,
             out_score.dptr_ + b * param_.rpn_post_nms_top_n);
         FRCNN_CUDA_CHECK(cudaPeekAtLastError());
