@@ -325,7 +325,7 @@ __global__ void nms_kernel(const int n_boxes, const float nms_overlap_thresh,
   }
 }
 
-void _nms(const mshadow::Tensor<gpu, 2>& boxes,
+void _nms(const mshadow::Tensor<gpu, 3>& boxes,
           const float nms_overlap_thresh,
           const int rpn_post_nms_top_n,
           int *keep,
@@ -354,7 +354,7 @@ void _nms(const mshadow::Tensor<gpu, 2>& boxes,
                               sizeof(uint64_t) * num_images * boxes_num * col_blocks,
                               cudaMemcpyDeviceToHost));
 
-  for (int img_idx = 0; img_idx < num_images, img_idx++) {
+  for (int img_idx = 0; img_idx < num_images; img_idx++) {
       std::vector<uint64_t> remv(col_blocks);
       memset(&remv[0], 0, sizeof(uint64_t) * col_blocks);
 
@@ -390,7 +390,7 @@ __global__ void PrepareOutput(const int count,
                               const int rpn_pre_nms_top_n,
                               Dtype* out,
                               Dtype* score) {
-  keep_start = image_index * rpn_pre_nms_top_n;
+  const int keep_start = image_index * rpn_pre_nms_top_n;
   for (int index = blockIdx.x * blockDim.x + threadIdx.x;
        index < count;
        index += blockDim.x * gridDim.x) {
